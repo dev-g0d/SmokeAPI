@@ -1,0 +1,1552 @@
+#define NOMINMAX // Prevents Windows.h from defining min/max macros that conflict with std::min/max
+#include <windows.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string>
+#include <fstream>
+#include <vector>
+#include <algorithm> // For std::transform
+#include <cctype>    // For ::tolower
+#include <time.h>    // Required for time(NULL) in some contexts, good to include.
+#include <tlhelp32.h> // For PROCESSENTRY32, CreateToolhelp32Snapshot, Process32First/Next
+#include <shlwapi.h> // For PathStripPathA (if needed, but strrchr is used for simplicity)
+#include <unordered_map> // For DLCs and Friend data
+#include <atomic>    // For std::atomic_bool
+
+// Ensure you link with detours.lib
+#include "detours.h"
+
+// IMPORTANT: You need to include steam_api_common.h and steamclientpublic.h for CSteamID and AppId_t
+// Ensure these header files are in your project's include path and match the SDK version used by the game.
+#include "steam_api_common.h"
+#include "isteamuser.h"
+#include "isteamapps.h"
+#include "isteamutils.h"
+#include "isteamclient.h" // Needed for ISteamClient getters
+#include "isteamremotestorage.h" // For Cloud Saves
+#include "isteamfriends.h"       // For Friends/Matchmaking
+#include "isteamuserstats.h"     // NEW: For user stats and achievements
+#include "steamclientpublic.h" // For definitions like EUserHasLicenseForAppResult, EPersonaState, etc.
+
+// Custom hash specialization for CSteamID
+// This is necessary because CSteamID is a custom type and std::unordered_map
+// needs to know how to hash it. We use the uint64 representation for hashing.
+namespace std {
+    template <>
+    struct hash<CSteamID> {
+        size_t operator()(const CSteamID& steamID) const {
+            return hash<uint64>()(steamID.ConvertToUint64());
+        }
+    };
+}
+
+// Global log file stream
+std::ofstream g_logFile;
+bool g_interfacesPatched = false;
+bool g_enableLogging = true; // Global flag to control logging
+
+// Global pointers to cache patched interfaces
+ISteamUser* g_pSteamUser = nullptr;
+ISteamApps* g_pSteamApps = nullptr;
+ISteamUtils* g_pSteamUtils = nullptr;
+ISteamRemoteStorage* g_pSteamRemoteStorage = nullptr;
+ISteamFriends* g_pSteamFriends = nullptr;
+ISteamUserStats* g_pSteamUserStats = nullptr; // NEW: Global pointer for ISteamUserStats
+
+
+// --- Emulator Configuration ---
+struct EmulatorConfig {
+    CSteamID SteamID;
+    AppId_t ForcedAppID; // Always 480
+    AppId_t RealAppID;   // From INI, for logging/reference
+    std::string Language;
+    uint32 BuildID;
+    std::string InstallDir;
+    bool ExtraProtection;
+    bool PhotonIntegration;
+    bool EmulateTicket;
+    bool EnableLogging; // Added to config struct
+
+    // Interface flags (for logging user intent, actual hooking still happens if needed)
+    bool HookApps;
+    bool HookUser;
+    bool HookUtils;
+    bool HookStorage;
+    bool HookUserStats;
+    bool HookFriends;
+    bool HookUGC;       // Not implemented yet
+    bool HookInventory; // Not implemented yet
+    bool HookAppTicket; // Part of ISteamUser::GetAuthSessionTicket
+
+    std::unordered_map<AppId_t, std::string> Dlcs; // DLC AppID -> Name
+};
+
+EmulatorConfig g_Config;
+
+// Global Simulated Player Data
+std::string g_PersonaName = "Emulator Player"; // Still used for emulated friend names (self)
+std::vector<CSteamID> g_Friends; // Simulated friends
+std::unordered_map<CSteamID, std::string> g_FriendPersonaNames;
+
+// Logging function
+void log_file(const char* fmt, ...) {
+    // Check g_enableLogging BEFORE attempting to open the file
+    if (!g_enableLogging) {
+        return;
+    }
+
+    if (!g_logFile.is_open()) {
+        g_logFile.open("steam_hook.log", std::ios_base::app);
+        if (!g_logFile.is_open()) { // Check if file opening actually succeeded
+            // If the file couldn't be opened, return to prevent further issues.
+            return;
+        }
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        g_logFile << "--- Log Session Start: "
+            << st.wYear << "-" << st.wMonth << "-" << st.wDay << " "
+            << st.wHour << ":" << st.wMinute << ":" << st.wSecond << " ---" << std::endl;
+    }
+
+    // Only write if the file stream is open (meaning logging is enabled and file opened successfully)
+    if (g_logFile.is_open()) {
+        va_list args;
+        va_start(args, fmt);
+        char buffer[1024];
+        vsnprintf(buffer, sizeof(buffer), fmt, args);
+        va_end(args);
+
+        g_logFile << buffer << std::endl;
+        g_logFile.flush();
+    }
+}
+
+// ---- Original Function Pointers ----
+typedef bool(__cdecl* tSteamAPI_Init)();
+tSteamAPI_Init orig_SteamAPI_Init = nullptr;
+
+typedef FARPROC(WINAPI* tGetProcAddress)(HMODULE hModule, LPCSTR lpProcName);
+tGetProcAddress TrueGetProcAddress = GetProcAddress;
+
+typedef bool(__cdecl* tSteamAPI_RestartAppIfNecessary)(AppId_t unAppID);
+tSteamAPI_RestartAppIfNecessary orig_SteamAPI_RestartAppIfNecessary = nullptr;
+
+// --- Pointers to original ISteamClient getters ---
+typedef ISteamUser* (__cdecl* tSteamAPI_ISteamClient_GetISteamUser)(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamUser orig_SteamAPI_ISteamClient_GetISteamUser = nullptr;
+
+typedef ISteamApps* (__cdecl* tSteamAPI_ISteamClient_GetISteamApps)(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamApps orig_SteamAPI_ISteamClient_GetISteamApps = nullptr;
+
+typedef ISteamUtils* (__cdecl* tSteamAPI_ISteamClient_GetISteamUtils)(ISteamClient* pSteamClient, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamUtils orig_SteamAPI_ISteamClient_GetISteamUtils = nullptr;
+
+typedef ISteamRemoteStorage* (__cdecl* tSteamAPI_ISteamClient_GetISteamRemoteStorage)(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamRemoteStorage orig_SteamAPI_ISteamClient_GetISteamRemoteStorage = nullptr;
+
+typedef ISteamFriends* (__cdecl* tSteamAPI_ISteamClient_GetISteamFriends)(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamFriends orig_SteamAPI_ISteamClient_GetISteamFriends = nullptr;
+
+typedef ISteamUserStats* (__cdecl* tSteamAPI_ISteamClient_GetISteamUserStats)(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion);
+tSteamAPI_ISteamClient_GetISteamUserStats orig_SteamAPI_ISteamClient_GetISteamUserStats = nullptr;
+
+
+// ---- ISteamUser Hooks (v020 assumed, indices approximate) ----
+typedef CSteamID(__stdcall* tUser_GetSteamID)(void*);
+CSteamID __stdcall fake_User_GetSteamID(void* self) {
+    log_file("[HOOK] ISteamUser::GetSteamID() -> %llu (Simulated)", g_Config.SteamID.ConvertToUint64());
+    return g_Config.SteamID;
+}
+
+typedef int(__stdcall* tUser_UserHasLicenseForApp)(void*, CSteamID, AppId_t);
+int __stdcall fake_User_UserHasLicenseForApp(void* self, CSteamID steamID, AppId_t appID) {
+    log_file("[HOOK] ISteamUser::UserHasLicenseForApp(SteamID:%llu, GameProvidedAppID:%u) -> HAS_LICENSE (0)", steamID.ConvertToUint64(), appID);
+    return 0; // k_EUserHasLicenseResultHasLicense
+}
+
+typedef bool(__stdcall* tUser_BLoggedOn)(void*);
+bool __stdcall fake_User_BLoggedOn(void* self) {
+    log_file("[HOOK] ISteamUser::BLoggedOn() -> TRUE");
+    return true;
+}
+
+// Common index for GetPlayerSteamLevel around 17-20
+typedef int(__stdcall* tUser_GetPlayerSteamLevel)(void*);
+int __stdcall fake_User_GetPlayerSteamLevel(void* self) {
+    log_file("[HOOK] ISteamUser::GetPlayerSteamLevel() -> 1 (Simulated)");
+    return 1; // Dummy level
+}
+
+// Common index for GetAuthSessionTicket around 20-25
+typedef HAuthTicket(__stdcall* tUser_GetAuthSessionTicket)(void*, void* pBlob, int cubBlob, uint32* pcbTicket, const char* pSteamID);
+HAuthTicket __stdcall fake_User_GetAuthSessionTicket(void* self, void* pBlob, int cubBlob, uint32* pcbTicket, const char* pSteamID) {
+    log_file("[HOOK] ISteamUser::GetAuthSessionTicket() called (EmulateTicket: %s).", g_Config.EmulateTicket ? "true" : "false");
+    if (g_Config.EmulateTicket) {
+        // Provide a dummy ticket. This is NOT a real Steam ticket.
+        // Games might expect some data, so we fill pBlob if provided.
+        const char* dummyTicket = "DUMMY_STEAM_AUTH_TICKET_DATA_12345567890";
+        int dummyTicketLen = static_cast<int>(strlen(dummyTicket)); // Cast strlen result
+
+        if (pBlob && cubBlob >= dummyTicketLen) {
+            memcpy(pBlob, dummyTicket, static_cast<size_t>(dummyTicketLen)); // Cast for memcpy size
+            if (pcbTicket) *pcbTicket = static_cast<uint32>(dummyTicketLen); // Cast for uint32
+            log_file("[HOOK] Dummy auth ticket provided. Len: %d", dummyTicketLen);
+        }
+        else if (pcbTicket) {
+            *pcbTicket = static_cast<uint32>(dummyTicketLen); // Cast for uint32
+            log_file("[HOOK] Dummy auth ticket size requested. Size: %d", dummyTicketLen);
+        }
+        return 1; // Non-zero ticket handle
+    }
+    return 0; // No ticket
+}
+
+// Common index for CancelAuthTicket
+typedef void(__stdcall* tUser_CancelAuthTicket)(void*, HAuthTicket hAuthTicket);
+void __stdcall fake_User_CancelAuthTicket(void* self, HAuthTicket hAuthTicket) {
+    log_file("[HOOK] ISteamUser::CancelAuthTicket(%u) called. (No-op)", hAuthTicket);
+}
+
+typedef const char* (__stdcall* tUser_GetUserDataFolder)(void*);
+const char* __stdcall fake_User_GetUserDataFolder(void* self) {
+    log_file("[HOOK] ISteamUser::GetUserDataFolder() -> 'userdata/'");
+    return "userdata/"; // A common dummy path
+}
+
+
+// ---- ISteamApps Hooks (v008/v009 assumed, indices approximate) ----
+typedef bool(__stdcall* tApps_BIsSubscribed)(void*);
+bool __stdcall fake_Apps_BIsSubscribed(void* self) {
+    log_file("[HOOK] ISteamApps::BIsSubscribed() -> TRUE");
+    return true;
+}
+
+typedef bool(__stdcall* tApps_BIsLowViolence)(void*);
+bool __stdcall fake_Apps_BIsLowViolence(void* self) {
+    log_file("[HOOK] ISteamApps::BIsLowViolence() -> FALSE");
+    return false;
+}
+
+typedef bool(__stdcall* tApps_BIsCybercafe)(void*);
+bool __stdcall fake_Apps_BIsCybercafe(void* self) {
+    log_file("[HOOK] ISteamApps::BIsCybercafe() -> FALSE");
+    return false;
+}
+
+typedef bool(__stdcall* tApps_BIsInstalled)(void*, AppId_t);
+bool __stdcall fake_Apps_BIsInstalled(void* self, AppId_t appID) {
+    log_file("[HOOK] ISteamApps::BIsInstalled(%u) -> TRUE", appID);
+    return true;
+}
+
+typedef bool(__stdcall* tApps_BIsSubscribedApp)(void*, AppId_t);
+bool __stdcall fake_Apps_BIsSubscribedApp(void*, AppId_t appID) {
+    log_file("[HOOK] ISteamApps::BIsSubscribedApp(%u) -> TRUE", appID);
+    return true;
+}
+
+typedef bool(__stdcall* tApps_BIsDlcInstalled)(void*, AppId_t);
+bool __stdcall fake_Apps_BIsDlcInstalled(void* self, AppId_t appID) {
+    bool installed = g_Config.Dlcs.count(appID) > 0;
+    log_file("[HOOK] ISteamApps::BIsDlcInstalled(%u) -> %s", appID, installed ? "TRUE" : "FALSE");
+    return installed;
+}
+
+typedef uint32(__stdcall* tApps_GetAppBuildId)(void*);
+uint32 __stdcall fake_Apps_GetAppBuildId(void* self) {
+    log_file("[HOOK] ISteamApps::GetAppBuildId() -> %u (Configured)", g_Config.BuildID);
+    return g_Config.BuildID;
+}
+
+typedef const char* (__stdcall* tApps_GetCurrentGameLanguage)(void*);
+const char* __stdcall fake_Apps_GetCurrentGameLanguage(void* self) {
+    log_file("[HOOK] ISteamApps::GetCurrentGameLanguage() -> \"%s\" (Configured)", g_Config.Language.c_str());
+    return g_Config.Language.c_str();
+}
+
+typedef bool(__stdcall* tApps_BIsSubscribedFromFamilySharing)(void*);
+bool __stdcall fake_Apps_BIsSubscribedFromFamilySharing(void* self) {
+    log_file("[HOOK] ISteamApps::BIsSubscribedFromFamilySharing() -> FALSE");
+    return false;
+}
+
+typedef bool(__stdcall* tApps_BIsSubscribedFromFreeWeekend)(void*);
+bool __stdcall fake_Apps_BIsSubscribedFromFreeWeekend(void* self) {
+    log_file("[HOOK] ISteamApps::BIsSubscribedFromFreeWeekend() -> FALSE");
+    return false;
+}
+
+typedef int(__stdcall* tApps_GetDLCCount)(void*);
+int __stdcall fake_Apps_GetDLCCount(void* self) {
+    log_file("[HOOK] ISteamApps::GetDLCCount() -> %zu (Configured DLCs)", g_Config.Dlcs.size());
+    return static_cast<int>(g_Config.Dlcs.size()); // Cast to int
+}
+
+typedef bool(__stdcall* tApps_GetDlcDownloadProgress)(void*, AppId_t, uint64*, uint64*);
+bool __stdcall fake_Apps_GetDlcDownloadProgress(void* self, AppId_t appID, uint64* punBytesDownloaded, uint64* punBytesTotal) {
+    if (g_Config.Dlcs.count(appID)) {
+        if (punBytesDownloaded) *punBytesDownloaded = 100; // Fully downloaded
+        if (punBytesTotal) *punBytesTotal = 100;
+        log_file("[HOOK] ISteamApps::GetDlcDownloadProgress(%u) -> TRUE (100%%)", appID);
+        return true;
+    }
+    log_file("[HOOK] ISteamApps::GetDlcDownloadProgress(%u) -> FALSE (DLC not found)", appID);
+    return false;
+}
+
+typedef const char* (__stdcall* tApps_GetInstalledAppPath)(void*, AppId_t, char*, int);
+const char* __stdcall fake_Apps_GetInstalledAppPath(void* self, AppId_t appID, char* pchPath, int cchPath) {
+    strncpy_s(pchPath, static_cast<size_t>(cchPath), g_Config.InstallDir.c_str(), static_cast<size_t>(cchPath - 1)); // Cast cchPath
+    pchPath[cchPath - 1] = '\0';
+    log_file("[HOOK] ISteamApps::GetInstalledAppPath(%u) -> \"%s\"", appID, pchPath);
+    return pchPath;
+}
+
+typedef int(__stdcall* tApps_GetLaunchCommandLine)(void*, char*, int);
+int __stdcall fake_Apps_GetLaunchCommandLine(void* self, char* pchCommandLine, int cubCommandLine) {
+    const char* dummyCmd = "game.exe -emulated";
+    strncpy_s(pchCommandLine, static_cast<size_t>(cubCommandLine), dummyCmd, static_cast<size_t>(cubCommandLine - 1)); // Cast cubCommandLine
+    pchCommandLine[cubCommandLine - 1] = '\0';
+    log_file("[HOOK] ISteamApps::GetLaunchCommandLine() -> \"%s\"", pchCommandLine);
+    return static_cast<int>(strlen(dummyCmd) + 1); // Cast to int
+}
+
+// Hook for ISteamApps::GetDlcDataByIndex
+typedef bool(__stdcall* tApps_GetDlcDataByIndex)(void*, int, AppId_t*, bool*, char*, int);
+bool __stdcall fake_Apps_GetDlcDataByIndex(void* self, int iDlc, AppId_t* pAppID, bool* pbAvailable, char* pchName, int cchName) {
+    log_file("[HOOK] ISteamApps::GetDlcDataByIndex(%d) called.", iDlc);
+    if (iDlc >= 0 && iDlc < static_cast<int>(g_Config.Dlcs.size())) {
+        auto it = g_Config.Dlcs.begin();
+        std::advance(it, iDlc); // Advance iterator to the correct DLC
+
+        if (pAppID) *pAppID = it->first;
+        if (pbAvailable) *pbAvailable = true; // Always available
+        if (pchName && cchName > 0) {
+            strncpy_s(pchName, static_cast<size_t>(cchName), it->second.c_str(), static_cast<size_t>(cchName - 1));
+            pchName[cchName - 1] = '\0';
+        }
+        log_file("[HOOK] ISteamApps::GetDlcDataByIndex(%d) -> AppID:%u, Name:\"%s\", Available:TRUE", iDlc, (pAppID ? *pAppID : 0), (pchName ? pchName : ""));
+        return true;
+    }
+    log_file("[HOOK] ISteamApps::GetDlcDataByIndex(%d) -> Invalid index, returning FALSE.", iDlc);
+    if (pAppID) *pAppID = 0;
+    if (pbAvailable) *pbAvailable = false;
+    if (pchName && cchName > 0) pchName[0] = '\0';
+    return false;
+}
+
+
+// ---- ISteamUtils Hooks (v010 assumed, indices approximate) ----
+typedef CSteamID(__stdcall* tUtils_GetSteamID)(void*);
+CSteamID __stdcall fake_Utils_GetSteamID(void* self) {
+    log_file("[HOOK] ISteamUtils::GetSteamID() -> %llu (Simulated)", g_Config.SteamID.ConvertToUint64());
+    return g_Config.SteamID;
+}
+
+typedef AppId_t(__stdcall* tUtils_GetAppID)(void*);
+AppId_t __stdcall fake_Utils_GetAppID(void* self) {
+    log_file("[HOOK] ISteamUtils::GetAppID() -> %u (Forced)", g_Config.ForcedAppID);
+    return g_Config.ForcedAppID;
+}
+
+typedef bool(__stdcall* tUtils_IsOverlayEnabled)(void*);
+bool __stdcall fake_Utils_IsOverlayEnabled(void* self) {
+    log_file("[HOOK] ISteamUtils::IsOverlayEnabled() -> TRUE");
+    return true; // Pretend overlay is enabled
+}
+
+typedef bool(__stdcall* tUtils_GetImageSize)(void*, int, uint32*, uint32*);
+bool __stdcall fake_Utils_GetImageSize(void* self, int iImage, uint32* pnWidth, uint32* pnHeight) {
+    if (pnWidth) *pnWidth = 32; // Dummy size
+    if (pnHeight) *pnHeight = 32;
+    log_file("[HOOK] ISteamUtils::GetImageSize(%d) -> TRUE (32x32)", iImage);
+    return true;
+}
+
+typedef bool(__stdcall* tUtils_GetImageRGBA)(void*, int, uint8*, int);
+bool __stdcall fake_Utils_GetImageRGBA(void* self, int iImage, uint8* pucDest, int nDestBufferSize) {
+    // Fill with dummy color (e.g., solid red)
+    if (pucDest && nDestBufferSize >= (32 * 32 * 4)) {
+        for (int i = 0; i < (32 * 32); ++i) {
+            pucDest[i * 4 + 0] = 255; // R
+            pucDest[i * 4 + 1] = 0;   // G
+            pucDest[i * 4 + 2] = 0;   // B
+            pucDest[i * 4 + 3] = 255; // A
+        }
+        log_file("[HOOK] ISteamUtils::GetImageRGBA(%d) -> TRUE (Dummy Red 32x32)", iImage);
+        return true;
+    }
+    log_file("[HOOK] ISteamUtils::GetImageRGBA(%d) -> FALSE (Buffer too small or null)", iImage);
+    return false;
+}
+
+typedef uint32(__stdcall* tUtils_GetIPCCallCount)(void*);
+uint32 __stdcall fake_Utils_GetIPCCallCount(void* self) {
+    log_file("[HOOK] ISteamUtils::GetIPCCallCount() -> 0");
+    return 0; // Dummy count
+}
+
+typedef bool(__stdcall* tUtils_IsSteamRunningInVR)(void*);
+bool __stdcall fake_Utils_IsSteamRunningInVR(void* self) {
+    log_file("[HOOK] ISteamUtils::IsSteamRunningInVR() -> FALSE");
+    return false;
+}
+
+typedef bool(__stdcall* tUtils_IsVRHeadsetReadyForUse)(void*);
+bool __stdcall fake_Utils_IsVRHeadsetReadyForUse(void* self) {
+    log_file("[HOOK] ISteamUtils::IsVRHeadsetReadyForUse() -> FALSE");
+    return false;
+}
+
+
+// ---- ISteamRemoteStorage Hooks (v013 assumed, indices approximate) ----
+// Cloud saves will be stored in `cloudsaves/{SteamID}/{AppID}/` relative to DLL
+std::string get_cloud_save_path(const char* pchFileName) {
+    char dllPath[MAX_PATH];
+    GetModuleFileNameA(NULL, dllPath, MAX_PATH); // Get EXE path
+    char* lastSlash = strrchr(dllPath, '\\');
+    if (lastSlash) *lastSlash = '\0';
+    else strcpy_s(dllPath, MAX_PATH, ".");
+
+    std::string savesDir = std::string(dllPath) + "\\cloudsaves\\" +
+        std::to_string(g_Config.SteamID.ConvertToUint64()) + "\\" +
+        std::to_string(g_Config.ForcedAppID) + "\\";
+
+    CreateDirectoryA(savesDir.c_str(), NULL); // Create base directory if it doesn't exist
+
+    // Create subdirectories for path if pchFileName contains slashes
+    std::string fullPath = savesDir + pchFileName;
+    size_t lastDirSlash = fullPath.find_last_of("\\/");
+    if (lastDirSlash != std::string::npos) {
+        std::string dirOnly = fullPath.substr(0, lastDirSlash);
+        CreateDirectoryA(dirOnly.c_str(), NULL);
+    }
+
+    return fullPath;
+}
+
+typedef bool(__stdcall* tRemoteStorage_FileWrite)(void*, const char*, const void*, int32);
+bool __stdcall fake_RemoteStorage_FileWrite(void* self, const char* pchFile, const void* pvData, int32 cubData) {
+    std::string path = get_cloud_save_path(pchFile);
+    std::ofstream file(path, std::ios::binary);
+    if (file.is_open()) {
+        file.write(static_cast<const char*>(pvData), static_cast<size_t>(cubData)); // Cast cubData for write
+        file.close();
+        log_file("[HOOK] ISteamRemoteStorage::FileWrite(\"%s\", %d bytes) -> TRUE (to %s)", pchFile, cubData, path.c_str());
+        return true;
+    }
+    log_file("[HOOK] ISteamRemoteStorage::FileWrite(\"%s\", %d bytes) -> FALSE (Failed to write to %s)", pchFile, cubData, path.c_str());
+    return false;
+}
+
+typedef int32(__stdcall* tRemoteStorage_FileRead)(void*, const char*, void*, int32);
+int32 __stdcall fake_RemoteStorage_FileRead(void* self, const char* pchFile, void* pvData, int32 cubDataToRead) {
+    std::string path = get_cloud_save_path(pchFile);
+    std::ifstream file(path, std::ios::binary | std::ios::ate); // Open at end to get size
+    if (file.is_open()) {
+        int32 fileSize = static_cast<int32>(file.tellg()); // Cast to int32
+        file.seekg(0, std::ios::beg); // Go back to beginning
+
+        if (fileSize > cubDataToRead) {
+            fileSize = cubDataToRead; // Read only up to cubDataToRead
+        }
+
+        file.read(static_cast<char*>(pvData), static_cast<size_t>(fileSize)); // Cast fileSize for read
+        file.close();
+        log_file("[HOOK] ISteamRemoteStorage::FileRead(\"%s\", %d bytes) -> %d bytes read (from %s)", pchFile, cubDataToRead, fileSize, path.c_str());
+        return fileSize;
+    }
+    log_file("[HOOK] ISteamRemoteStorage::FileRead(\"%s\", %d bytes) -> -1 (File not found %s)", pchFile, cubDataToRead, path.c_str());
+    return -1;
+}
+
+typedef bool(__stdcall* tRemoteStorage_FileForget)(void*, const char*);
+bool __stdcall fake_RemoteStorage_FileForget(void* self, const char* pchFile) {
+    std::string path = get_cloud_save_path(pchFile);
+    if (DeleteFileA(path.c_str())) {
+        log_file("[HOOK] ISteamRemoteStorage::FileForget(\"%s\") -> TRUE (Deleted %s)", pchFile, path.c_str());
+        return true;
+    }
+    log_file("[HOOK] ISteamRemoteStorage::FileForget(\"%s\") -> FALSE (Failed to delete %s)", pchFile, path.c_str());
+    return false;
+}
+
+typedef bool(__stdcall* tRemoteStorage_FileExists)(void*, const char*);
+bool __stdcall fake_RemoteStorage_FileExists(void* self, const char* pchFile) {
+    std::string path = get_cloud_save_path(pchFile);
+    DWORD attrib = GetFileAttributesA(path.c_str());
+    bool exists = (attrib != INVALID_FILE_ATTRIBUTES && !(attrib & FILE_ATTRIBUTE_DIRECTORY));
+    log_file("[HOOK] ISteamRemoteStorage::FileExists(\"%s\") -> %s", pchFile, exists ? "TRUE" : "FALSE");
+    return exists;
+}
+
+typedef bool(__stdcall* tRemoteStorage_FilePersisted)(void*, const char*);
+bool __stdcall fake_RemoteStorage_FilePersisted(void* self, const char* pchFile) {
+    // If it exists locally, we consider it "persisted" for this emulator.
+    std::string path = get_cloud_save_path(pchFile);
+    DWORD attrib = GetFileAttributesA(path.c_str());
+    bool persisted = (attrib != INVALID_FILE_ATTRIBUTES && !(attrib & FILE_ATTRIBUTE_DIRECTORY));
+    log_file("[HOOK] ISteamRemoteStorage::FilePersisted(\"%s\") -> %s", pchFile, persisted ? "TRUE" : "FALSE");
+    return persisted;
+}
+
+typedef int32(__stdcall* tRemoteStorage_GetFileSize)(void*, const char*);
+int32 __stdcall fake_RemoteStorage_GetFileSize(void* self, const char* pchFile) {
+    std::string path = get_cloud_save_path(pchFile);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (file.is_open()) {
+        int32 fileSize = static_cast<int32>(file.tellg()); // Cast to int32
+        file.close();
+        log_file("[HOOK] ISteamRemoteStorage::GetFileSize(\"%s\") -> %d", pchFile, fileSize);
+        return fileSize;
+    }
+    log_file("[HOOK] ISteamRemoteStorage::GetFileSize(\"%s\") -> -1 (File not found)", pchFile);
+    return -1;
+}
+
+typedef int32(__stdcall* tRemoteStorage_GetFileCount)(void*);
+int32 __stdcall fake_RemoteStorage_GetFileCount(void* self) {
+    // This is complex to implement fully for arbitrary subdirectories.
+    // For simplicity, we just log and return 0.
+    // A real implementation would iterate files in get_cloud_save_path().
+    log_file("[HOOK] ISteamRemoteStorage::GetFileCount() -> 0 (Not fully implemented)");
+    return 0; // Dummy
+}
+
+typedef const char* (__stdcall* tRemoteStorage_GetFileNameAndSize)(void*, int, int32*);
+const char* __stdcall fake_RemoteStorage_GetFileNameAndSize(void* self, int iFile, int32* pnFileSizeInBytes) {
+    // Similar to GetFileCount, this is complex without a file iteration mechanism.
+    log_file("[HOOK] ISteamRemoteStorage::GetFileNameAndSize(%d) -> NULL (Not fully implemented)", iFile);
+    if (pnFileSizeInBytes) *pnFileSizeInBytes = 0;
+    return NULL; // Dummy
+}
+
+
+// ---- ISteamFriends Hooks (v017 assumed, indices approximate) ----
+// Removed fake_Friends_GetPersonaName hook so game gets real persona name
+typedef void(__stdcall* tFriends_SetPersonaName)(void*, const char*);
+void __stdcall fake_Friends_SetPersonaName(void* self, const char* pchPersonaName) {
+    g_PersonaName = pchPersonaName;
+    log_file("[HOOK] ISteamFriends::SetPersonaName(\"%s\") -> Name updated (emulator state only)", pchPersonaName);
+    // Call original if needed, but for real persona, we avoid intercepting.
+}
+
+typedef EPersonaState(__stdcall* tFriends_GetPersonaState)(void*);
+EPersonaState __stdcall fake_Friends_GetPersonaState(void* self) {
+    log_file("[HOOK] ISteamFriends::GetPersonaState() -> k_EPersonaStateOnline");
+    return k_EPersonaStateOnline;
+}
+
+typedef int(__stdcall* tFriends_GetFriendCount)(void*, int);
+int __stdcall fake_Friends_GetFriendCount(void* self, int iFriendFlags) {
+    // Return a dummy friend count (e.g., self + any added dummy friends)
+    log_file("[HOOK] ISteamFriends::GetFriendCount(0x%X) -> %zu", iFriendFlags, g_Friends.size());
+    return static_cast<int>(g_Friends.size()); // Cast to int
+}
+
+typedef CSteamID(__stdcall* tFriends_GetFriendByIndex)(void*, int, int);
+CSteamID __stdcall fake_Friends_GetFriendByIndex(void* self, int iFriend, int iFriendFlags) {
+    if (iFriend >= 0 && iFriend < static_cast<int>(g_Friends.size())) { // Cast to int for comparison
+        log_file("[HOOK] ISteamFriends::GetFriendByIndex(%d, 0x%X) -> %llu", iFriend, iFriendFlags, g_Friends[iFriend].ConvertToUint64());
+        return g_Friends[iFriend];
+    }
+    log_file("[HOOK] ISteamFriends::GetFriendByIndex(%d, 0x%X) -> Invalid Index, returning 0", iFriend, iFriendFlags);
+    return CSteamID(); // Invalid SteamID
+}
+
+typedef const char* (__stdcall* tFriends_GetFriendPersonaName)(void*, CSteamID);
+const char* __stdcall fake_Friends_GetFriendPersonaName(void* self, CSteamID steamIDFriend) {
+    if (steamIDFriend == g_Config.SteamID) {
+        log_file("[HOOK] ISteamFriends::GetFriendPersonaName(%llu) -> \"%s\" (Simulated Self Name)", steamIDFriend.ConvertToUint64(), g_PersonaName.c_str());
+        return g_PersonaName.c_str(); // Return local emulator persona name for self
+    }
+    auto it = g_FriendPersonaNames.find(steamIDFriend);
+    if (it != g_FriendPersonaNames.end()) {
+        log_file("[HOOK] ISteamFriends::GetFriendPersonaName(%llu) -> \"%s\"", steamIDFriend.ConvertToUint64(), it->second.c_str());
+        return it->second.c_str();
+    }
+    log_file("[HOOK] ISteamFriends::GetFriendPersonaName(%llu) -> \"Unknown Friend\"", steamIDFriend.ConvertToUint64());
+    return "Unknown Friend"; // Default for unknown friends
+}
+
+typedef EPersonaState(__stdcall* tFriends_GetFriendPersonaState)(void*, CSteamID);
+EPersonaState __stdcall fake_Friends_GetFriendPersonaState(void* self, CSteamID steamIDFriend) {
+    log_file("[HOOK] ISteamFriends::GetFriendPersonaState(%llu) -> k_EPersonaStateOnline", steamIDFriend.ConvertToUint64());
+    return k_EPersonaStateOnline; // All friends are online
+}
+
+typedef bool(__stdcall* tFriends_SetRichPresence)(void*, const char*, const char*);
+bool __stdcall fake_Friends_SetRichPresence(void* self, const char* pchKey, const char* pchValue) {
+    log_file("[HOOK] ISteamFriends::SetRichPresence(\"%s\", \"%s\") -> TRUE", pchKey, pchValue);
+    return true; // Always successful
+}
+
+typedef void(__stdcall* tFriends_ClearRichPresence)(void*);
+void __stdcall fake_Friends_ClearRichPresence(void* self) {
+    log_file("[HOOK] ISteamFriends::ClearRichPresence() called.");
+}
+
+typedef EFriendRelationship(__stdcall* tFriends_GetFriendRelationship)(void*, CSteamID);
+EFriendRelationship __stdcall fake_Friends_GetFriendRelationship(void* self, CSteamID steamIDFriend) {
+    // These values (0 and 1) correspond to k_ERelationshipNone and k_ERelationshipFriend
+    // as found in typical Steamworks SDK headers for EFriendRelationship.
+    // Using explicit integer casts here to bypass potential compiler issues
+    // with enum scope or declaration in some SDK versions.
+    if (steamIDFriend == g_Config.SteamID) {
+        log_file("[HOOK] ISteamFriends::GetFriendRelationship(%llu) -> %d (Self)", steamIDFriend.ConvertToUint64(), 0);
+        return static_cast<EFriendRelationship>(0);
+    }
+    auto it = g_FriendPersonaNames.find(steamIDFriend);
+    if (it != g_FriendPersonaNames.end()) {
+        log_file("[HOOK] ISteamFriends::GetFriendRelationship(%llu) -> %d (Friend)", steamIDFriend.ConvertToUint64(), 1);
+        return static_cast<EFriendRelationship>(1);
+    }
+    log_file("[HOOK] ISteamFriends::GetFriendRelationship(%llu) -> %d (None)", steamIDFriend.ConvertToUint64(), 0);
+    return static_cast<EFriendRelationship>(0);
+}
+
+typedef bool(__stdcall* tFriends_GetFriendGamePlayed)(void*, CSteamID, FriendGameInfo_t*);
+bool __stdcall fake_Friends_GetFriendGamePlayed(void* self, CSteamID steamIDFriend, FriendGameInfo_t* pGameInfo) {
+    if (pGameInfo) {
+        pGameInfo->m_gameID = CGameID(g_Config.ForcedAppID); // Corrected CGameID initialization
+        // Removed assignments to m_usPort and m_steamIDLobby due to potential SDK version differences.
+        // If these are needed, verify their exact names/types in your specific steamclientpublic.h/isteamfriends.h
+        // and uncomment/adjust accordingly.
+        pGameInfo->m_unGameIP = 0; // m_unGameIP is likely always present
+        // pGameInfo->m_usPort = 0; // Temporarily commented out due to compile errors
+        // pGameInfo->m_steamIDLobby = CSteamID(); // Temporarily commented out due to compile errors
+        log_file("[HOOK] ISteamFriends::GetFriendGamePlayed(%llu) -> TRUE (Playing AppID %u)", steamIDFriend.ConvertToUint64(), g_Config.ForcedAppID);
+        return true;
+    }
+    log_file("[HOOK] ISteamFriends::GetFriendGamePlayed(%llu) -> FALSE (No game info provided)", steamIDFriend.ConvertToUint64());
+    return false;
+}
+
+
+// ---- ISteamUserStats Hooks (NEW) ----
+typedef SteamAPICall_t(__stdcall* tUserStats_RequestCurrentStats)(void*);
+SteamAPICall_t __stdcall fake_UserStats_RequestCurrentStats(void* self) {
+    log_file("[HOOK] ISteamUserStats::RequestCurrentStats() called. Returning dummy API Call result.");
+    // This is often needed to signal to the game that stats are ready to be queried.
+    // A real implementation would involve callbacks, but for basic unlocking, returning a non-zero handle might suffice.
+    return 1; // Dummy API Call handle
+}
+
+typedef bool(__stdcall* tUserStats_GetAchievementDisplayAttribute)(void*, const char* pchAchievementName, const char* pchKey, char* pchBuffer, uint32 cubBuffer);
+bool __stdcall fake_UserStats_GetAchievementDisplayAttribute(void* self, const char* pchAchievementName, const char* pchKey, char* pchBuffer, uint32 cubBuffer) {
+    log_file("[HOOK] ISteamUserStats::GetAchievementDisplayAttribute(ach:\"%s\", key:\"%s\") called.", pchAchievementName, pchKey);
+    // Games sometimes use hidden achievements to signal DLC ownership.
+    // If key is "name" or "desc", provide dummy values.
+    // If key is related to "unlocked" state, might need special handling.
+    if (strcmp(pchKey, "name") == 0) {
+        strncpy_s(pchBuffer, cubBuffer, "Dummy Achievement Name", cubBuffer - 1);
+        pchBuffer[cubBuffer - 1] = '\0';
+        log_file("[HOOK] -> Name: \"%s\"", pchBuffer);
+        return true;
+    }
+    else if (strcmp(pchKey, "desc") == 0) {
+        strncpy_s(pchBuffer, cubBuffer, "Dummy Achievement Description", cubBuffer - 1);
+        pchBuffer[cubBuffer - 1] = '\0';
+        log_file("[HOOK] -> Desc: \"%s\"", pchBuffer);
+        return true;
+    }
+    else {
+        // For other keys, especially boolean ones like "hidden", "unlocked", etc.,
+        // we might need to return specific values or log more detail.
+        // For now, return false for unknown keys.
+        log_file("[HOOK] -> Unknown key, returning FALSE.");
+        return false;
+    }
+}
+
+typedef bool(__stdcall* tUserStats_SetAchievement)(void*, const char* pchAchievementName);
+bool __stdcall fake_UserStats_SetAchievement(void* self, const char* pchAchievementName) {
+    log_file("[HOOK] ISteamUserStats::SetAchievement(\"%s\") called. (No-op)", pchAchievementName);
+    return true; // Always successful
+}
+
+typedef bool(__stdcall* tUserStats_GetAchievement)(void*, const char* pchAchievementName, bool* pbAchieved);
+bool __stdcall fake_UserStats_GetAchievement(void* self, const char* pchAchievementName, bool* pbAchieved) {
+    if (pbAchieved) {
+        *pbAchieved = true; // Always return true for any queried achievement
+        log_file("[HOOK] ISteamUserStats::GetAchievement(\"%s\") -> TRUE (Achieved)", pchAchievementName);
+        return true;
+    }
+    log_file("[HOOK] ISteamUserStats::GetAchievement(\"%s\") -> FALSE (pbAchieved NULL)", pchAchievementName);
+    return false;
+}
+
+// Add more UserStats hooks as needed, e.g., GetStat, StoreStats etc.
+// For now, basic RequestCurrentStats and GetAchievement might be sufficient for DLC checks.
+
+
+// ---- New Hook for SteamAPI_RestartAppIfNecessary ----
+bool __cdecl fake_SteamAPI_RestartAppIfNecessary(AppId_t unAppID) {
+    log_file("[HOOK] SteamAPI_RestartAppIfNecessary(%u) called. Returning FALSE to prevent restart.", unAppID);
+    return false;
+}
+
+
+// ---- General VTable Patching Function ----
+void patch_vtable(void** vtable, int idx, void* func, const char* name) {
+    if (!vtable || idx < 0) {
+        log_file("ERROR: Invalid vtable or index for %s[%d]. Skipping patch.", name, idx);
+        return;
+    }
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtable[idx], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        log_file("ERROR: VirtualProtect failed for %s vtable[%d] at %p: %lu. Skipping patch.", name, idx, vtable[idx], GetLastError());
+        return;
+    }
+
+    void* orig = vtable[idx];
+    vtable[idx] = func;
+
+    if (!VirtualProtect(&vtable[idx], sizeof(void*), oldProtect, &oldProtect)) {
+        log_file("ERROR: VirtualProtect restore failed for %s vtable[%d]: %lu.", name, idx, GetLastError());
+    }
+
+    log_file("Patch %s vtable[%d] = %p (orig %p)", name, idx, func, orig);
+}
+
+// ---- Interface Patching Functions ----
+void patch_steamuser(void* pUser) {
+    if (!pUser) {
+        log_file("WARN: ISteamUser pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pUser;
+    log_file("Attempting to patch ISteamUser interface at %p, vtable at %p", pUser, vtable);
+
+    // Common ISteamUser Hooks (v020 assumed)
+    if (g_Config.HookUser) { // Apply hook based on config
+        patch_vtable(vtable, 0, (void*)&fake_User_GetSteamID, "ISteamUser::GetSteamID");
+        patch_vtable(vtable, 1, (void*)&fake_User_BLoggedOn, "ISteamUser::BLoggedOn");
+        patch_vtable(vtable, 19, (void*)&fake_User_GetPlayerSteamLevel, "ISteamUser::GetPlayerSteamLevel"); // Common index
+        patch_vtable(vtable, 20, (void*)&fake_User_GetAuthSessionTicket, "ISteamUser::GetAuthSessionTicket"); // Common index
+        patch_vtable(vtable, 21, (void*)&fake_User_CancelAuthTicket, "ISteamUser::CancelAuthTicket"); // Common index
+
+        // Added more detailed logging for UserHasLicenseForApp
+        log_file("DEBUG: ISteamUser::UserHasLicenseForApp vtable entry BEFORE patch (index 36): %p", vtable[36]);
+        patch_vtable(vtable, 36, (void*)&fake_User_UserHasLicenseForApp, "ISteamUser::UserHasLicenseForApp"); // Common index
+        log_file("DEBUG: ISteamUser::UserHasLicenseForApp vtable entry AFTER patch (index 36): %p", vtable[36]);
+
+        patch_vtable(vtable, 38, (void*)&fake_User_GetUserDataFolder, "ISteamUser::GetUserDataFolder"); // Common index
+    }
+    else {
+        log_file("Skipping ISteamUser hooks as per config.");
+    }
+}
+
+void patch_steamapps(void* pApps) {
+    if (!pApps) {
+        log_file("WARN: ISteamApps pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pApps;
+    log_file("Attempting to patch ISteamApps interface at %p, vtable at %p", pApps, vtable);
+
+    // Common ISteamApps Hooks (v008/v009 assumed)
+    if (g_Config.HookApps) { // Apply hook based on config
+        patch_vtable(vtable, 0, (void*)&fake_Apps_BIsSubscribed, "ISteamApps::BIsSubscribed");
+        patch_vtable(vtable, 1, (void*)&fake_Apps_BIsLowViolence, "ISteamApps::BIsLowViolence");
+        patch_vtable(vtable, 2, (void*)&fake_Apps_BIsCybercafe, "ISteamApps::BIsCybercafe");
+        patch_vtable(vtable, 3, (void*)&fake_Apps_BIsInstalled, "ISteamApps::BIsInstalled");
+        patch_vtable(vtable, 4, (void*)&fake_Apps_BIsSubscribedApp, "ISteamApps::BIsSubscribedApp");
+        patch_vtable(vtable, 5, (void*)&fake_Apps_BIsDlcInstalled, "ISteamApps::BIsDlcInstalled");
+        patch_vtable(vtable, 6, (void*)&fake_Apps_GetAppBuildId, "ISteamApps::GetAppBuildId");
+        patch_vtable(vtable, 7, (void*)&fake_Apps_GetCurrentGameLanguage, "ISteamApps::GetCurrentGameLanguage");
+        patch_vtable(vtable, 10, (void*)&fake_Apps_BIsSubscribedFromFamilySharing, "ISteamApps::BIsSubscribedFromFamilySharing");
+        patch_vtable(vtable, 11, (void*)&fake_Apps_BIsSubscribedFromFreeWeekend, "ISteamApps::BIsSubscribedFromFreeWeekend");
+        patch_vtable(vtable, 12, (void*)&fake_Apps_GetDLCCount, "ISteamApps::GetDLCCount");
+        patch_vtable(vtable, 13, (void*)&fake_Apps_GetDlcDownloadProgress, "ISteamApps::GetDlcDownloadProgress"); // Common index
+        patch_vtable(vtable, 14, (void*)&fake_Apps_GetDlcDataByIndex, "ISteamApps::GetDlcDataByIndex"); // NEW: Hook for GetDlcDataByIndex
+        patch_vtable(vtable, 16, (void*)&fake_Apps_GetInstalledAppPath, "ISteamApps::GetInstalledAppPath"); // Common index
+        patch_vtable(vtable, 23, (void*)&fake_Apps_GetLaunchCommandLine, "ISteamApps::GetLaunchCommandLine"); // Common index
+    }
+    else {
+        log_file("Skipping ISteamApps hooks as per config.");
+    }
+}
+
+void patch_steamutils(void* pUtils) {
+    if (!pUtils) {
+        log_file("WARN: ISteamUtils pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pUtils;
+    log_file("Attempting to patch ISteamUtils interface at %p, vtable at %p", pUtils, vtable);
+
+    // Common ISteamUtils Hooks (v010 assumed)
+    if (g_Config.HookUtils) { // Apply hook based on config
+        patch_vtable(vtable, 0, (void*)&fake_Utils_GetSteamID, "ISteamUtils::GetSteamID");
+        patch_vtable(vtable, 9, (void*)&fake_Utils_GetAppID, "ISteamUtils::GetAppID");
+        patch_vtable(vtable, 13, (void*)&fake_Utils_IsOverlayEnabled, "ISteamUtils::IsOverlayEnabled"); // Common index
+        patch_vtable(vtable, 15, (void*)&fake_Utils_GetImageSize, "ISteamUtils::GetImageSize"); // Common index
+        patch_vtable(vtable, 16, (void*)&fake_Utils_GetImageRGBA, "ISteamUtils::GetImageRGBA"); // Common index
+        patch_vtable(vtable, 17, (void*)&fake_Utils_GetIPCCallCount, "ISteamUtils::GetIPCCallCount"); // Common index
+        patch_vtable(vtable, 19, (void*)&fake_Utils_IsSteamRunningInVR, "ISteamUtils::IsSteamRunningInVR"); // Common index
+        patch_vtable(vtable, 20, (void*)&fake_Utils_IsVRHeadsetReadyForUse, "ISteamUtils::IsVRHeadsetReadyForUse"); // Common index
+    }
+    else {
+        log_file("Skipping ISteamUtils hooks as per config.");
+    }
+}
+
+void patch_steamremotestorage(void* pRemoteStorage) {
+    if (!pRemoteStorage) {
+        log_file("WARN: ISteamRemoteStorage pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pRemoteStorage;
+    log_file("Attempting to patch ISteamRemoteStorage interface at %p, vtable at %p", pRemoteStorage, vtable);
+
+    // Common ISteamRemoteStorage Hooks (v013 assumed)
+    if (g_Config.HookStorage) { // Apply hook based on config
+        patch_vtable(vtable, 0, (void*)&fake_RemoteStorage_FileWrite, "ISteamRemoteStorage::FileWrite");
+        patch_vtable(vtable, 1, (void*)&fake_RemoteStorage_FileRead, "ISteamRemoteStorage::FileRead");
+        patch_vtable(vtable, 2, (void*)&fake_RemoteStorage_FileForget, "ISteamRemoteStorage::FileForget");
+        patch_vtable(vtable, 3, (void*)&fake_RemoteStorage_FileExists, "ISteamRemoteStorage::FileExists");
+        patch_vtable(vtable, 4, (void*)&fake_RemoteStorage_FilePersisted, "ISteamRemoteStorage::FilePersisted");
+        patch_vtable(vtable, 5, (void*)&fake_RemoteStorage_GetFileSize, "ISteamRemoteStorage::GetFileSize");
+        patch_vtable(vtable, 10, (void*)&fake_RemoteStorage_GetFileCount, "ISteamRemoteStorage::GetFileCount");
+        patch_vtable(vtable, 11, (void*)&fake_RemoteStorage_GetFileNameAndSize, "ISteamRemoteStorage::GetFileNameAndSize");
+    }
+    else {
+        log_file("Skipping ISteamRemoteStorage hooks as per config.");
+    }
+}
+
+void patch_steamfriends(void* pFriends) {
+    if (!pFriends) {
+        log_file("WARN: ISteamFriends pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pFriends;
+    log_file("Attempting to patch ISteamFriends interface at %p, vtable at %p", pFriends, vtable);
+
+    // Common ISteamFriends Hooks (v017 assumed)
+    if (g_Config.HookFriends) { // Apply hook based on config
+        // Removed GetPersonaName hook (index 0) to allow game to get real persona name from Steam.
+        patch_vtable(vtable, 1, (void*)&fake_Friends_SetPersonaName, "ISteamFriends::SetPersonaName");
+        patch_vtable(vtable, 2, (void*)&fake_Friends_GetPersonaState, "ISteamFriends::GetPersonaState");
+        patch_vtable(vtable, 3, (void*)&fake_Friends_GetFriendCount, "ISteamFriends::GetFriendCount");
+        patch_vtable(vtable, 4, (void*)&fake_Friends_GetFriendByIndex, "ISteamFriends::GetFriendByIndex");
+        patch_vtable(vtable, 5, (void*)&fake_Friends_GetFriendPersonaName, "ISteamFriends::GetFriendPersonaName");
+        patch_vtable(vtable, 6, (void*)&fake_Friends_GetFriendPersonaState, "ISteamFriends::GetFriendPersonaState");
+        patch_vtable(vtable, 10, (void*)&fake_Friends_SetRichPresence, "ISteamFriends::SetRichPresence");
+        patch_vtable(vtable, 11, (void*)&fake_Friends_ClearRichPresence, "ISteamFriends::ClearRichPresence");
+        patch_vtable(vtable, 15, (void*)&fake_Friends_GetFriendRelationship, "ISteamFriends::GetFriendRelationship");
+        patch_vtable(vtable, 16, (void*)&fake_Friends_GetFriendGamePlayed, "ISteamFriends::GetFriendGamePlayed");
+    }
+    else {
+        log_file("Skipping ISteamFriends hooks as per config.");
+    }
+}
+
+void patch_steamuserstats(void* pUserStats) {
+    if (!pUserStats) {
+        log_file("WARN: ISteamUserStats pointer is NULL. Cannot patch.");
+        return;
+    }
+    void** vtable = *(void***)pUserStats;
+    log_file("Attempting to patch ISteamUserStats interface at %p, vtable at %p", pUserStats, vtable);
+
+    // Common ISteamUserStats Hooks (v011 assumed)
+    if (g_Config.HookUserStats) { // Apply hook based on config
+        patch_vtable(vtable, 0, (void*)&fake_UserStats_RequestCurrentStats, "ISteamUserStats::RequestCurrentStats");
+        patch_vtable(vtable, 3, (void*)&fake_UserStats_GetAchievement, "ISteamUserStats::GetAchievement"); // Index varies, this is common for v011/v012
+        patch_vtable(vtable, 5, (void*)&fake_UserStats_SetAchievement, "ISteamUserStats::SetAchievement"); // Index varies
+        patch_vtable(vtable, 14, (void*)&fake_UserStats_GetAchievementDisplayAttribute, "ISteamUserStats::GetAchievementDisplayAttribute"); // Index varies
+    }
+    else {
+        log_file("Skipping ISteamUserStats hooks as per config.");
+    }
+}
+
+
+// --- Centralized Interface Patching Logic ---
+void ApplyInterfacePatches() {
+    if (g_interfacesPatched) {
+        log_file("Interfaces already patched. Skipping.");
+        return;
+    }
+
+    log_file("Attempting to apply Steamworks Interface patches...");
+
+    HMODULE hSteamApi = GetModuleHandleA("steam_api64.dll");
+    if (!hSteamApi) {
+        hSteamApi = GetModuleHandleA("steam_api.dll");
+    }
+
+    if (!hSteamApi) {
+        log_file("ERROR: steam_api module not found during interface patching. Cannot patch interfaces.");
+        return;
+    }
+
+    log_file("Found steam_api module at %p for interface retrieval.", hSteamApi);
+    g_interfacesPatched = true;
+    log_file("Finished attempting to apply Steamworks Interface patches. Interfaces will be patched via ISteamClient getters.");
+}
+
+// Global flag to track if original SteamAPI_Init has been called
+static std::atomic_bool s_originalSteamApiInitCalled = false;
+
+// ---- SteamAPI_Init hook ----
+bool __cdecl fake_SteamAPI_Init() {
+    log_file("[HOOK] Entering fake_SteamAPI_Init (called by game).");
+
+    if (!s_originalSteamApiInitCalled.exchange(true)) { // Only call original once
+        if (orig_SteamAPI_Init) {
+            orig_SteamAPI_Init(); // Call original once
+            log_file("[HOOK] Original SteamAPI_Init called once. Its return value is now ignored by emulator.");
+        }
+        else {
+            log_file("ERROR: orig_SteamAPI_Init is NULL in fake_SteamAPI_Init on first call! This is critical. Attempting to continue.");
+        }
+        ApplyInterfacePatches(); // Apply patches after first (attempted) original init
+    }
+    else {
+        log_file("[HOOK] Subsequent call to fake_SteamAPI_Init. Original already called. Skipping original init and re-applying patches.");
+        ApplyInterfacePatches(); // Ensure interfaces are patched even on subsequent calls if needed
+    }
+
+    log_file("[HOOK] Exiting fake_SteamAPI_Init. FORCING RETURN TRUE (1) to the game.");
+    return true;
+}
+
+// ---- ISteamClient Hooked Getters ----
+ISteamUser* __cdecl fake_SteamAPI_ISteamClient_GetISteamUser(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamUser != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamUser (cached) -> %p", g_pSteamUser);
+        return g_pSteamUser;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamUser(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookUser ? "true" : "false");
+    ISteamUser* pUser = orig_SteamAPI_ISteamClient_GetISteamUser(pSteamClient, hSteamUser, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamUser returned %p. Attempting to patch.", pUser);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pUser != nullptr && (uintptr_t)pUser > 0x10000) {
+        patch_steamuser(pUser);
+        g_pSteamUser = pUser; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamUser returned NULL or an invalid low address (%p). Cannot patch.", pUser);
+    }
+    return pUser;
+}
+
+ISteamApps* __cdecl fake_SteamAPI_ISteamClient_GetISteamApps(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamApps != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamApps (cached) -> %p", g_pSteamApps);
+        return g_pSteamApps;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamApps(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookApps ? "true" : "false");
+    ISteamApps* pApps = orig_SteamAPI_ISteamClient_GetISteamApps(pSteamClient, hSteamUser, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamApps returned %p. Attempting to patch.", pApps);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pApps != nullptr && (uintptr_t)pApps > 0x10000) {
+        patch_steamapps(pApps);
+        g_pSteamApps = pApps; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamApps returned NULL or an invalid low address (%p). Cannot patch.", pApps);
+    }
+    return pApps;
+}
+
+ISteamUtils* __cdecl fake_SteamAPI_ISteamClient_GetISteamUtils(ISteamClient* pSteamClient, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamUtils != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamUtils (cached) -> %p", g_pSteamUtils);
+        return g_pSteamUtils;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamUtils(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookUtils ? "true" : "false");
+    ISteamUtils* pUtils = orig_SteamAPI_ISteamClient_GetISteamUtils(pSteamClient, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamUtils returned %p. Attempting to patch.", pUtils);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pUtils != nullptr && (uintptr_t)pUtils > 0x10000) { // Heuristic: pointer usually won't be this low
+        patch_steamutils(pUtils);
+        g_pSteamUtils = pUtils; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamUtils returned NULL or an invalid low address (%p). Cannot patch.", pUtils);
+    }
+    return pUtils;
+}
+
+ISteamRemoteStorage* __cdecl fake_SteamAPI_ISteamClient_GetISteamRemoteStorage(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamRemoteStorage != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamRemoteStorage (cached) -> %p", g_pSteamRemoteStorage);
+        return g_pSteamRemoteStorage;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamRemoteStorage(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookStorage ? "true" : "false");
+    ISteamRemoteStorage* pRemoteStorage = orig_SteamAPI_ISteamClient_GetISteamRemoteStorage(pSteamClient, hSteamUser, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamRemoteStorage returned %p. Attempting to patch.", pRemoteStorage);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pRemoteStorage != nullptr && (uintptr_t)pRemoteStorage > 0x10000) {
+        patch_steamremotestorage(pRemoteStorage);
+        g_pSteamRemoteStorage = pRemoteStorage; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamRemoteStorage returned NULL or an invalid low address (%p). Cannot patch.", pRemoteStorage);
+    }
+    return pRemoteStorage;
+}
+
+ISteamFriends* __cdecl fake_SteamAPI_ISteamClient_GetISteamFriends(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamFriends != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamFriends (cached) -> %p", g_pSteamFriends);
+        return g_pSteamFriends;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamFriends(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookFriends ? "true" : "false");
+    ISteamFriends* pFriends = orig_SteamAPI_ISteamClient_GetISteamFriends(pSteamClient, hSteamUser, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamFriends returned %p. Attempting to patch.", pFriends);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pFriends != nullptr && (uintptr_t)pFriends > 0x10000) {
+        patch_steamfriends(pFriends);
+        g_pSteamFriends = pFriends; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamFriends returned NULL or an invalid low address (%p). Cannot patch.", pFriends);
+    }
+    return pFriends;
+}
+
+ISteamUserStats* __cdecl fake_SteamAPI_ISteamClient_GetISteamUserStats(ISteamClient* pSteamClient, HSteamUser hSteamUser, HSteamPipe hSteamPipe, const char* pchVersion) {
+    if (g_pSteamUserStats != nullptr) { // If already patched, return cached instance
+        log_file("[HOOK] ISteamClient::GetISteamUserStats (cached) -> %p", g_pSteamUserStats);
+        return g_pSteamUserStats;
+    }
+
+    log_file("[HOOK] ISteamClient::GetISteamUserStats(version: %s) called. Configured to hook: %s", pchVersion, g_Config.HookUserStats ? "true" : "false");
+    ISteamUserStats* pUserStats = orig_SteamAPI_ISteamClient_GetISteamUserStats(pSteamClient, hSteamUser, hSteamPipe, pchVersion);
+    log_file("[HOOK] Original ISteamClient::GetISteamUserStats returned %p. Attempting to patch.", pUserStats);
+    // Add a check for obviously invalid low-memory addresses or NULL
+    if (pUserStats != nullptr && (uintptr_t)pUserStats > 0x10000) {
+        patch_steamuserstats(pUserStats);
+        g_pSteamUserStats = pUserStats; // Cache the patched pointer
+    }
+    else {
+        log_file("WARN: Original ISteamClient::GetISteamUserStats returned NULL or an invalid low address (%p). Cannot patch.", pUserStats);
+    }
+    return pUserStats;
+}
+
+
+// ---- Hook GetProcAddress ----
+FARPROC WINAPI DetourGetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    FARPROC pfnResult = TrueGetProcAddress(hModule, lpProcName);
+
+    if (pfnResult != nullptr && hModule != nullptr && lpProcName != nullptr) {
+        char szModuleName[MAX_PATH];
+        GetModuleFileNameA(hModule, szModuleName, MAX_PATH);
+        std::string moduleName = szModuleName;
+
+        std::transform(moduleName.begin(), moduleName.end(), moduleName.begin(),
+            [](unsigned char c) { return static_cast<unsigned char>(std::tolower(c)); });
+
+        if (moduleName.find("steam_api.dll") != std::string::npos ||
+            moduleName.find("steam_api64.dll") != std::string::npos)
+        {
+            // Intercept SteamAPI_Init
+            if (strcmp(lpProcName, "SteamAPI_Init") == 0) {
+                if (orig_SteamAPI_Init == nullptr) {
+                    orig_SteamAPI_Init = (tSteamAPI_Init)pfnResult;
+                    log_file("[HOOK_GPA] Intercepted SteamAPI_Init. Original address: %p", orig_SteamAPI_Init);
+
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourDetach(&(PVOID&)TrueGetProcAddress, DetourGetProcAddress); // Temporarily detach GPA
+                    DetourAttach(&(PVOID&)orig_SteamAPI_Init, fake_SteamAPI_Init);
+                    LONG error = DetourTransactionCommit();
+                    if (error == NO_ERROR) {
+                        log_file("[HOOK_GPA] Successfully hooked SteamAPI_Init! (Detached/Re-attached GetProcAddress temporarily)");
+                    }
+                    else {
+                        log_file("ERROR: Failed to hook SteamAPI_Init: %lu", error);
+                    }
+                    // Re-attach GPA for subsequent calls
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)TrueGetProcAddress, DetourGetProcAddress);
+                    error = DetourTransactionCommit();
+                    if (error != NO_ERROR) {
+                        log_file("ERROR: Failed to re-attach GetProcAddress: %lu", error);
+                    }
+                    return (FARPROC)fake_SteamAPI_Init;
+                }
+            }
+            // Intercept SteamAPI_RestartAppIfNecessary
+            else if (strcmp(lpProcName, "SteamAPI_RestartAppIfNecessary") == 0) {
+                if (orig_SteamAPI_RestartAppIfNecessary == nullptr) {
+                    orig_SteamAPI_RestartAppIfNecessary = (tSteamAPI_RestartAppIfNecessary)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_RestartAppIfNecessary, fake_SteamAPI_RestartAppIfNecessary);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_RestartAppIfNecessary -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            // Intercept ISteamClient Getters
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamUser") == 0) {
+                if (orig_SteamAPI_ISteamClient_GetISteamUser == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamUser = (tSteamAPI_ISteamClient_GetISteamUser)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUser, fake_SteamAPI_ISteamClient_GetISteamUser);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamUser -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamApps") == 0) {
+                if (orig_SteamAPI_ISteamClient_GetISteamApps == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamApps = (tSteamAPI_ISteamClient_GetISteamApps)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamApps, fake_SteamAPI_ISteamClient_GetISteamApps);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamApps -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamUtils") == 0) {
+                if (orig_SteamAPI_ISteamClient_GetISteamUtils == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamUtils = (tSteamAPI_ISteamClient_GetISteamUtils)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUtils, fake_SteamAPI_ISteamClient_GetISteamUtils);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamUtils -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamRemoteStorage") == 0) {
+                if (orig_SteamAPI_ISteamClient_GetISteamRemoteStorage == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamRemoteStorage = (tSteamAPI_ISteamClient_GetISteamRemoteStorage)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamRemoteStorage, fake_SteamAPI_ISteamClient_GetISteamRemoteStorage);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamRemoteStorage -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamFriends") == 0) {
+                if (orig_SteamAPI_ISteamClient_GetISteamFriends == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamFriends = (tSteamAPI_ISteamClient_GetISteamFriends)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamFriends, fake_SteamAPI_ISteamClient_GetISteamFriends);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamFriends -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+            else if (strcmp(lpProcName, "SteamAPI_ISteamClient_GetISteamUserStats") == 0) { // NEW: Hook ISteamUserStats
+                if (orig_SteamAPI_ISteamClient_GetISteamUserStats == nullptr) {
+                    orig_SteamAPI_ISteamClient_GetISteamUserStats = (tSteamAPI_ISteamClient_GetISteamUserStats)pfnResult;
+                    DetourTransactionBegin();
+                    DetourUpdateThread(GetCurrentThread());
+                    DetourAttach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUserStats, fake_SteamAPI_ISteamClient_GetISteamUserStats);
+                    LONG error = DetourTransactionCommit();
+                    log_file("[HOOK_GPA] Hooked SteamAPI_ISteamClient_GetISteamUserStats -> %p. Result: %lu", pfnResult, error);
+                }
+            }
+        }
+    }
+    return pfnResult;
+}
+
+// --- Helper for INI parsing ---
+// Original GetPrivateProfileBoolA: reads value as int (0 or 1)
+// We need a new helper to read "true"/"false" strings
+bool GetPrivateProfileBoolFromStringA(LPCSTR lpAppName, LPCSTR lpKeyName, BOOL bDefault, LPCSTR lpFileName) {
+    char szRet[16]; // Buffer to hold "true", "false", "1", "0"
+    GetPrivateProfileStringA(lpAppName, lpKeyName, bDefault ? "true" : "false", szRet, sizeof(szRet), lpFileName);
+    std::string sRet = szRet;
+    std::transform(sRet.begin(), sRet.end(), sRet.begin(), [](unsigned char c) { return static_cast<unsigned char>(std::tolower(c)); });
+    return (sRet == "true" || sRet == "1");
+}
+
+
+bool IsSteamRunning() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        log_file("ERROR: CreateToolhelp32Snapshot failed for IsSteamRunning(). GetLastError: %lu", GetLastError());
+        return false;
+    }
+
+    PROCESSENTRY32 pe32 = { sizeof(pe32) };
+    bool found = false;
+
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            char procName[MAX_PATH];
+            WideCharToMultiByte(CP_ACP, 0, pe32.szExeFile, -1, procName, MAX_PATH, NULL, NULL);
+            if (_stricmp(procName, "steam.exe") == 0) {
+                found = true;
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+    else {
+        log_file("ERROR: Process32First failed in IsSteamRunning(). GetLastError: %lu", GetLastError());
+    }
+
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+void initialize_emulator_settings() {
+    // Initialize default config values
+    g_Config.SteamID = CSteamID(76561198000000000ULL); // Default Steam ID
+    g_Config.ForcedAppID = 480; // Default ForcedAppID
+    g_Config.RealAppID = 0;   // Will be read from INI
+    g_Config.Language = "english";
+    uint32 defaultBuildID = 1; // Default build ID
+    g_Config.BuildID = defaultBuildID;
+    g_Config.InstallDir = ".\\"; // Current directory by default
+    g_Config.ExtraProtection = false;
+    g_Config.PhotonIntegration = false;
+    g_Config.EmulateTicket = true; // Default to true as requested
+    g_Config.EnableLogging = true; // Default to true
+
+    g_Config.HookApps = true;
+    g_Config.HookUser = true;
+    g_Config.HookUtils = true;
+    g_Config.HookStorage = true;
+    g_Config.HookUserStats = true;
+    g_Config.HookFriends = true;
+    g_Config.HookUGC = true;
+    g_Config.HookInventory = true;
+    g_Config.HookAppTicket = true;
+
+    // Add a dummy friend for ISteamFriends
+    g_Friends.push_back(g_Config.SteamID); // Self is always a "friend" for count
+    CSteamID dummyFriend1(76561198000000001ULL);
+    g_Friends.push_back(dummyFriend1);
+    g_FriendPersonaNames[dummyFriend1] = "Dummy Friend 1";
+
+    // Determine DLL path and INI path first, before any logging influenced by INI
+    char dllPath[MAX_PATH] = { 0 };
+    char g0dIniPath[MAX_PATH] = { 0 };
+    HMODULE currentModule = NULL;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)initialize_emulator_settings, &currentModule);
+    GetModuleFileNameA(currentModule, dllPath, MAX_PATH);
+    char* dllLastSlash = strrchr(dllPath, '\\');
+    if (dllLastSlash) *dllLastSlash = '\0';
+    else {
+        strcpy_s(dllPath, MAX_PATH, ".");
+    }
+    strcpy_s(g0dIniPath, MAX_PATH, dllPath); strcat_s(g0dIniPath, MAX_PATH, "\\g0d.ini");
+
+    char iniPath[MAX_PATH] = { 0 };
+    bool iniFound = false;
+
+    // Check for g0d.ini and set iniFound flag
+    if (GetFileAttributesA(g0dIniPath) != INVALID_FILE_ATTRIBUTES) {
+        strcpy_s(iniPath, MAX_PATH, g0dIniPath);
+        iniFound = true;
+    }
+
+    // Read the Logs setting as early as possible to control all subsequent logging
+    if (iniFound) {
+        g_enableLogging = GetPrivateProfileBoolFromStringA("misc", "Logs", true, iniPath); // Default to true if not found
+    }
+    else {
+        // If INI is not found at all, default logging to true, but also clearly state this problem.
+        g_enableLogging = true;
+        log_file("[G0D_INIT] WARNING: g0d.ini not found at DLL path '%s'. Defaulting to enabled logging.", g0dIniPath);
+    }
+
+    // Now that g_enableLogging is set, start logging the initialization process
+    log_file("[G0D_INIT] Initializing emulator settings. Looking for INI at: %s", g0dIniPath); // Added this specific log
+    if (iniFound) {
+        log_file("[G0D_INIT] Found g0d.ini at: %s", iniPath);
+    }
+    else {
+        log_file("[G0D_INIT] ERROR: No INI file (g0d.ini) found at '%s'. Cannot proceed. Exiting process.", g0dIniPath);
+        MessageBoxA(NULL, "No configuration INI file found (g0d.ini) next to the emulator DLL. Cannot proceed.", "Emulator Error", MB_OK | MB_ICONERROR);
+        ExitProcess(1);
+    }
+
+    if (!IsSteamRunning()) {
+        log_file("[G0D_INIT] ERROR: Steam not launched. Exiting process.");
+        MessageBoxA(NULL, "Steam not launched. Please start Steam before launching the game.", "Emulator Error", MB_OK | MB_ICONERROR);
+        ExitProcess(1);
+    }
+
+    char tempBuffer[256]; // General buffer for INI reads
+
+    // Read [fix_g0d] section
+    GetPrivateProfileStringA("fix_g0d", "g0d", "", tempBuffer, sizeof(tempBuffer), iniPath);
+    const char* initial_g0d = "dc26fa8a4dd0eedec9b3d639315c832290eb2a8c7a2b3ec45ff616de";
+    const char* target_g0d = "f1ff7af0e5bfcd03a25872a6f721437538a2eed494c79c847aa8f64a32e2fec3";
+
+    if (strcmp(tempBuffer, initial_g0d) == 0) {
+        log_file("[G0D_INIT] Initial g0d hash matched. Updating INI to target hash.");
+        MessageBoxA(NULL, "Fix by g0d", "g0d", MB_OK | MB_ICONINFORMATION);
+        WritePrivateProfileStringA("fix_g0d", "g0d", target_g0d, iniPath);
+    }
+    else if (strcmp(tempBuffer, target_g0d) != 0) {
+        log_file("[G0D_INIT] ERROR: g0d hash mismatch. Self-Protecting. Exiting process.");
+        MessageBoxA(NULL, "Self-Protect.", "Error", MB_OK | MB_ICONERROR);
+        ExitProcess(1);
+    }
+    else {
+        log_file("[G0D_INIT] g0d hash already at target value or not present. Continuing.");
+    }
+
+    // Read RealAppId (for logging, not used by emulator's forced AppID)
+    g_Config.RealAppID = GetPrivateProfileIntA("fix_g0d", "RealAppId", 0, iniPath);
+    log_file("[G0D_INIT] RealAppId from INI: %u", g_Config.RealAppID);
+
+    // Read FakeAppId and use it for g_Config.ForcedAppID
+    // Ensure FakeAppId is read and if it's a valid ID, use it. Otherwise, default to 480.
+    AppId_t iniFakeAppId = (AppId_t)GetPrivateProfileIntA("fix_g0d", "FakeAppId", 0, iniPath);
+    if (iniFakeAppId != 0) {
+        g_Config.ForcedAppID = iniFakeAppId;
+        log_file("[G0D_INIT] FakeAppId from INI: %u. Using this for ForcedAppID.", g_Config.ForcedAppID);
+    }
+    else {
+        log_file("[G0D_INIT] FakeAppId not found or invalid in INI. Defaulting ForcedAppID to %u.", g_Config.ForcedAppID);
+    }
+
+    // Read Language
+    GetPrivateProfileStringA("fix_g0d", "Language", g_Config.Language.c_str(), tempBuffer, sizeof(tempBuffer), iniPath);
+    g_Config.Language = tempBuffer;
+    log_file("[G0D_INIT] Language: %s", g_Config.Language.c_str());
+
+    // Read BuildId
+    g_Config.BuildID = GetPrivateProfileIntA("fix_g0d", "BuildId", 1, iniPath); // Always default to 1 as a non-zero fallback
+    if (g_Config.BuildID == 0) { // If INI explicitly provides 0, force to 1
+        g_Config.BuildID = 1;
+        log_file("[G0D_INIT] BuildId from INI was 0, forcing to 1.");
+    }
+    log_file("[G0D_INIT] BuildId: %u", g_Config.BuildID);
+
+    // Read InstallDir
+    GetPrivateProfileStringA("fix_g0d", "InstallDir", ".\\", tempBuffer, sizeof(tempBuffer), iniPath);
+    if (tempBuffer[0] != '\0') { // Check if something was read
+        g_Config.InstallDir = tempBuffer;
+    }
+    else {
+        // If InstallDir is empty in INI, ensure it defaults to ".\"
+        g_Config.InstallDir = ".\\";
+    }
+    log_file("[G0D_INIT] InstallDir: %s", g_Config.InstallDir.c_str());
+
+    // Read [misc] section using the new string-based bool reader
+    g_Config.ExtraProtection = GetPrivateProfileBoolFromStringA("misc", "ExtraProtection", g_Config.ExtraProtection, iniPath);
+    log_file("[G0D_INIT] ExtraProtection: %s", g_Config.ExtraProtection ? "true" : "false");
+    g_Config.PhotonIntegration = GetPrivateProfileBoolFromStringA("misc", "PhotonIntegration", g_Config.PhotonIntegration, iniPath);
+    log_file("[G0D_INIT] PhotonIntegration: %s", g_Config.PhotonIntegration ? "true" : "false");
+    g_Config.EmulateTicket = GetPrivateProfileBoolFromStringA("misc", "EmulateTicket", g_Config.EmulateTicket, iniPath);
+    log_file("[G0D_INIT] EmulateTicket: %s", g_Config.EmulateTicket ? "true" : "false");
+
+    // Sync g_Config.EnableLogging with g_enableLogging (already set above)
+    g_Config.EnableLogging = g_enableLogging;
+    log_file("[G0D_INIT] Logs: %s (final state)", g_Config.EnableLogging ? "true" : "false");
+
+
+    // Read [interfaces] section using the new string-based bool reader
+    g_Config.HookApps = GetPrivateProfileBoolFromStringA("interfaces", "Apps", g_Config.HookApps, iniPath);
+    log_file("[G0D_INIT] HookApps: %s", g_Config.HookApps ? "true" : "false");
+    g_Config.HookUser = GetPrivateProfileBoolFromStringA("interfaces", "User", g_Config.HookUser, iniPath);
+    log_file("[G0D_INIT] HookUser: %s", g_Config.HookUser ? "true" : "false");
+    g_Config.HookUtils = GetPrivateProfileBoolFromStringA("interfaces", "Utils", g_Config.HookUtils, iniPath);
+    log_file("[G0D_INIT] HookUtils: %s", g_Config.HookUtils ? "true" : "false");
+    g_Config.HookStorage = GetPrivateProfileBoolFromStringA("interfaces", "Storage", g_Config.HookStorage, iniPath);
+    log_file("[G0D_INIT] HookStorage: %s", g_Config.HookStorage ? "true" : "false");
+    g_Config.HookUserStats = GetPrivateProfileBoolFromStringA("interfaces", "UserStats", g_Config.HookUserStats, iniPath);
+    log_file("[G0D_INIT] HookUserStats: %s", g_Config.HookUserStats ? "true" : "false");
+    g_Config.HookFriends = GetPrivateProfileBoolFromStringA("interfaces", "Friends", g_Config.HookFriends, iniPath);
+    log_file("[G0D_INIT] HookFriends: %s", g_Config.HookFriends ? "true" : "false");
+    g_Config.HookUGC = GetPrivateProfileBoolFromStringA("interfaces", "UGC", g_Config.HookUGC, iniPath);
+    log_file("[G0D_INIT] HookUGC: %s", g_Config.HookUGC ? "true" : "false");
+    g_Config.HookInventory = GetPrivateProfileBoolFromStringA("interfaces", "Inventory", g_Config.HookInventory, iniPath);
+    log_file("[G0D_INIT] HookInventory: %s", g_Config.HookInventory ? "true" : "false");
+    g_Config.HookAppTicket = GetPrivateProfileBoolFromStringA("interfaces", "AppTicket", g_Config.HookAppTicket, iniPath);
+    log_file("[G0D_INIT] HookAppTicket: %s", g_Config.HookAppTicket ? "true" : "false");
+
+
+    // Read [dlcs] section
+    char sectionBuffer[4096];
+    // Add more diagnostic logging here
+    log_file("[G0D_INIT] DEBUG: Attempting to read [dlcs] section. iniPath: %s", iniPath);
+    DWORD len = GetPrivateProfileSectionA("dlcs", sectionBuffer, sizeof(sectionBuffer), iniPath);
+    log_file("[G0D_INIT] DEBUG: GetPrivateProfileSectionA for [dlcs] returned length: %lu. Buffer size: %zu", len, sizeof(sectionBuffer));
+
+    if (len == 0) {
+        log_file("WARN: [dlcs] section is empty or not found in INI at '%s'.", iniPath);
+    }
+    else if (len >= sizeof(sectionBuffer) - 2) { // -2 for double null terminator
+        log_file("WARN: [dlcs] section buffer might be too small for INI at '%s'. Data might be truncated. Consider increasing buffer size (current: %zu bytes).", iniPath, sizeof(sectionBuffer));
+        // Log a snippet even if truncated, to see what was read
+        std::string bufferSnippet(sectionBuffer, std::min((size_t)len, (size_t)256));
+        log_file("[G0D_INIT] DEBUG: [dlcs] section buffer snippet (first %zu bytes): '%s'", bufferSnippet.length(), bufferSnippet.c_str());
+    }
+    else {
+        // Log a snippet of the buffer content if it's successfully read
+        std::string bufferSnippet(sectionBuffer, std::min((size_t)len, (size_t)256));
+        log_file("[G0D_INIT] DEBUG: [dlcs] section buffer snippet (first %zu bytes): '%s'", bufferSnippet.length(), bufferSnippet.c_str());
+
+        char* p = sectionBuffer;
+        // The loop condition also needs to ensure we don't go past the buffer's valid data based on 'len'
+        while (*p != '\0' && (p - sectionBuffer) < len) {
+            std::string line(p);
+            // Trim leading/trailing whitespace from the line before processing
+            size_t first = line.find_first_not_of(" \t\n\r");
+            size_t last = line.find_last_not_of(" \t\n\r");
+            if (std::string::npos == first) { // Line is all whitespace or empty
+                log_file("[G0D_INIT] Skipped empty or whitespace-only line in [dlcs] section: '%s'", line.c_str());
+                p += line.length() + 1;
+                continue;
+            }
+            line = line.substr(first, (last - first + 1));
+
+            size_t eqPos = line.find('=');
+            if (eqPos != std::string::npos && eqPos > 0) { // Ensure '=' is found and not at the beginning
+                std::string dlcIdStr = line.substr(0, eqPos);
+                std::string dlcName = line.substr(eqPos + 1);
+                AppId_t dlcAppId = static_cast<AppId_t>(atoi(dlcIdStr.c_str()));
+                if (dlcAppId != 0) { // Ensure AppID is not 0 (invalid)
+                    g_Config.Dlcs[dlcAppId] = dlcName;
+                    log_file("[G0D_INIT] Loaded DLC: ID %u = \"%s\"", dlcAppId, dlcName.c_str());
+                }
+                else {
+                    log_file("[G0D_INIT] WARN: Invalid DLC AppID (0) for entry: '%s' (from INI at '%s')", line.c_str(), iniPath);
+                }
+            }
+            else {
+                log_file("[G0D_INIT] WARN: Invalid line format in [dlcs] section (missing '=' or empty key): '%s' (from INI at '%s')", line.c_str(), iniPath);
+            }
+            // Move pointer past current string and its null terminator
+            p += line.length() + 1;
+        }
+    }
+    log_file("[G0D_INIT] Total DLCs loaded: %zu", g_Config.Dlcs.size());
+
+    // CRITICAL: Force SteamAppId and OverlayGameID to g_Config.ForcedAppID
+    char forcedAppIdStr[16];
+    sprintf_s(forcedAppIdStr, sizeof(forcedAppIdStr), "%u", g_Config.ForcedAppID);
+
+    log_file("[G0D_INIT] Setting environment variable SteamAppId to '%s'.", forcedAppIdStr);
+    SetEnvironmentVariableA("SteamAppId", forcedAppIdStr);
+
+    log_file("[G0D_INIT] Setting environment variable OverlayGameID to '%s'.", forcedAppIdStr);
+    SetEnvironmentVariableA("OverlayGameID", forcedAppIdStr);
+
+    log_file("[G0D_INIT] Setting environment variable STEAM_RUNTIME to '1'.");
+    SetEnvironmentVariableA("STEAM_RUNTIME", "1");
+    log_file("[G0D_INIT] Emulator settings initialized successfully.");
+}
+
+
+// Main thread for hooking (runs in the injected process)
+DWORD WINAPI MainThread(LPVOID) {
+    log_file("MainThread started for Steam Emulator. Hooking GetProcAddress...");
+
+    DetourTransactionBegin();
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&(PVOID&)TrueGetProcAddress, DetourGetProcAddress);
+    LONG error_code = DetourTransactionCommit();
+
+    if (error_code == NO_ERROR) {
+        log_file("Detoured GetProcAddress successfully! Waiting for game to request Steam API functions...");
+    }
+    else {
+        log_file("ERROR: Detoring GetProcAddress failed with error: %lu. Exiting MainThread.", error_code);
+        MessageBoxA(NULL, "Failed to initialize emulator hooks. Please check log file for details.", "Emulator Error", MB_OK | MB_ICONERROR);
+        ExitProcess(1);
+    }
+
+    while (true) {
+        Sleep(1000);
+    }
+    return 0;
+}
+
+// Global flag to ensure DllMain PROCESS_ATTACH runs only once per process
+static std::atomic_bool s_isDllInitialized = false;
+
+// DLL Entry Point
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
+    LONG error_code = NO_ERROR;
+
+    switch (ul_reason_for_call) {
+    case DLL_PROCESS_ATTACH:
+        if (s_isDllInitialized.exchange(true)) { // Atomically set to true and check previous value
+            // Already attached and initialized for this process.
+            // This prevents re-initialization if DllMain is called multiple times for some reason
+            // within the same process.
+            log_file("SteamEmulator.dll already initialized in this process. Skipping re-initialization logic.");
+            return TRUE; // Do not proceed with initialization again
+        }
+
+        DisableThreadLibraryCalls(hModule);
+        initialize_emulator_settings(); // This will log its own initialization status
+        // Only log this once after the main initialization
+        log_file("SteamEmulator.dll attached to process. First-time initialization complete.");
+
+        CreateThread(0, 0, MainThread, 0, 0, 0);
+        break;
+    case DLL_PROCESS_DETACH:
+        log_file("SteamEmulator.dll detached from process. Attempting to unhook...");
+        DetourTransactionBegin();
+        DetourUpdateThread(GetCurrentThread());
+
+        log_file("[G0D_INIT] Clearing environment variables.");
+        SetEnvironmentVariableA("SteamAppId", NULL);
+        SetEnvironmentVariableA("OverlayGameID", NULL);
+        SetEnvironmentVariableA("STEAM_RUNTIME", NULL);
+
+        // Ensure we detach from all hooks
+        if (TrueGetProcAddress != GetProcAddress) {
+            DetourDetach(&(PVOID&)TrueGetProcAddress, DetourGetProcAddress);
+        }
+        if (orig_SteamAPI_Init) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_Init, fake_SteamAPI_Init);
+        }
+        if (orig_SteamAPI_RestartAppIfNecessary) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_RestartAppIfNecessary, fake_SteamAPI_RestartAppIfNecessary);
+        }
+        // Detach from ISteamClient Getters
+        if (orig_SteamAPI_ISteamClient_GetISteamUser) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUser, fake_SteamAPI_ISteamClient_GetISteamUser);
+        }
+        if (orig_SteamAPI_ISteamClient_GetISteamApps) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamApps, fake_SteamAPI_ISteamClient_GetISteamApps);
+        }
+        if (orig_SteamAPI_ISteamClient_GetISteamUtils) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUtils, fake_SteamAPI_ISteamClient_GetISteamUtils);
+        }
+        if (orig_SteamAPI_ISteamClient_GetISteamRemoteStorage) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamRemoteStorage, fake_SteamAPI_ISteamClient_GetISteamRemoteStorage);
+        }
+        if (orig_SteamAPI_ISteamClient_GetISteamFriends) {
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamFriends, fake_SteamAPI_ISteamClient_GetISteamFriends);
+        }
+        if (orig_SteamAPI_ISteamClient_GetISteamUserStats) { // NEW: Detach ISteamUserStats
+            DetourDetach(&(PVOID&)orig_SteamAPI_ISteamClient_GetISteamUserStats, fake_SteamAPI_ISteamClient_GetISteamUserStats);
+        }
+
+
+        error_code = DetourTransactionCommit();
+        if (error_code == NO_ERROR) {
+            log_file("Successfully unhooked.");
+        }
+        else {
+            log_file("Failed to unhook with error: %lu.", error_code);
+        }
+        if (g_logFile.is_open()) {
+            g_logFile.close();
+        }
+        break;
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+        break;
+    }
+    return TRUE;
+}
